@@ -284,11 +284,13 @@ export const AuthAndBootstrapView: React.FC<AuthAndBootstrapViewProps> = ({
   const [inviteError, setInviteError] = useState<string | null>(null);
   const [retryInviteCounter, setRetryInviteCounter] = useState(0);
 
-  // Login form state
+  // Login form state & Brute-Force Protection (5 attempts -> 60s lockout)
   const [loginUsername, setLoginUsername] = useState('');
   const [loginPassword, setLoginPassword] = useState('');
   const [showAdminFallbackPasswordLogin, setShowAdminFallbackPasswordLogin] =
     useState(false);
+  const [failedLoginAttempts, setFailedLoginAttempts] = useState(0);
+  const [lockoutSecondsLeft, setLockoutSecondsLeft] = useState(0);
 
   // Invite registration / recovery form state
   const [regFullName, setRegFullName] = useState('');
@@ -339,6 +341,21 @@ export const AuthAndBootstrapView: React.FC<AuthAndBootstrapViewProps> = ({
     });
     return () => unsubscribe();
   }, [firebaseReady]);
+
+  // Brute-Force lockout countdown timer (60s cooldown after 5 failed attempts)
+  useEffect(() => {
+    if (lockoutSecondsLeft <= 0) return;
+    const timer = window.setInterval(() => {
+      setLockoutSecondsLeft((prev) => {
+        if (prev <= 1) {
+          setFailedLoginAttempts(0);
+          return 0;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [lockoutSecondsLeft]);
 
   // Save/restore ?invite=TOKEN&fb=CONFIG across browser -> installed PWA handoff
   useEffect(() => {
@@ -1096,6 +1113,12 @@ export const AuthAndBootstrapView: React.FC<AuthAndBootstrapViewProps> = ({
 
   const handleFamilyLoginSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (lockoutSecondsLeft > 0) {
+      setErrorMsg(
+        `Ochrona anty-Brute-Force: odczekaj jeszcze ${lockoutSecondsLeft}s przed kolejną próbą logowania.`
+      );
+      return;
+    }
     setErrorMsg(null);
     setIsFamilyLoading(true);
     try {
@@ -1103,10 +1126,21 @@ export const AuthAndBootstrapView: React.FC<AuthAndBootstrapViewProps> = ({
         loginUsername.trim().toLowerCase(),
         loginPassword
       );
+      setFailedLoginAttempts(0);
+      setLockoutSecondsLeft(0);
     } catch (err) {
-      setErrorMsg(
-        err instanceof Error ? err.message : 'Błąd podczas logowania.'
-      );
+      const nextFails = failedLoginAttempts + 1;
+      setFailedLoginAttempts(nextFails);
+      if (nextFails >= 5) {
+        setLockoutSecondsLeft(60);
+        setErrorMsg(
+          'Wykryto 5 nieudanych prób logowania z rzędu! Formularz został tymczasowo zablokowany na 60 sekund (Ochrona anty-Brute-Force).'
+        );
+      } else {
+        const baseMsg =
+          err instanceof Error ? err.message : 'Błąd podczas logowania.';
+        setErrorMsg(`${baseMsg} (Próba ${nextFails}/5)`);
+      }
     } finally {
       setIsFamilyLoading(false);
     }
@@ -1527,14 +1561,16 @@ export const AuthAndBootstrapView: React.FC<AuthAndBootstrapViewProps> = ({
 
               <button
                 type="submit"
-                disabled={isFamilyLoading}
-                className="w-full inline-flex items-center justify-center gap-2 px-4 py-3 text-sm font-semibold text-[#FAF7F2] bg-[var(--vault-accent)] hover:bg-[var(--vault-accent-hover)] rounded-xl transition-colors cursor-pointer"
+                disabled={isFamilyLoading || lockoutSecondsLeft > 0}
+                className="w-full inline-flex items-center justify-center gap-2 px-4 py-3 text-sm font-semibold text-[#FAF7F2] bg-[var(--vault-accent)] hover:bg-[var(--vault-accent-hover)] disabled:opacity-50 rounded-xl transition-colors cursor-pointer tabular-nums"
               >
                 <LogIn className="w-4 h-4" />
                 <span>
-                  {isFamilyLoading
-                    ? 'Weryfikacja certyfikatu sprzętowego...'
-                    : 'Zaloguj się do skarbca'}
+                  {lockoutSecondsLeft > 0
+                    ? `Blokada anty-Brute-Force (${lockoutSecondsLeft}s)`
+                    : isFamilyLoading
+                      ? 'Weryfikacja certyfikatu sprzętowego...'
+                      : 'Zaloguj się do skarbca'}
                 </span>
               </button>
             </form>
@@ -1887,10 +1923,12 @@ export const AuthAndBootstrapView: React.FC<AuthAndBootstrapViewProps> = ({
                 </div>
                 <button
                   type="submit"
-                  disabled={isFamilyLoading}
-                  className="w-full py-2 text-xs font-semibold text-[#FAF7F2] bg-[var(--vault-accent)] rounded-lg cursor-pointer"
+                  disabled={isFamilyLoading || lockoutSecondsLeft > 0}
+                  className="w-full py-2 text-xs font-semibold text-[#FAF7F2] bg-[var(--vault-accent)] disabled:opacity-50 rounded-lg cursor-pointer tabular-nums"
                 >
-                  Zaloguj loginem i hasłem
+                  {lockoutSecondsLeft > 0
+                    ? `Blokada anty-Brute-Force (${lockoutSecondsLeft}s)`
+                    : 'Zaloguj loginem i hasłem'}
                 </button>
               </form>
             )}

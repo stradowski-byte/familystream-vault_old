@@ -21,6 +21,11 @@ import {
   BellRing,
   AlertTriangle,
   Send,
+  History,
+  RotateCcw,
+  Clock,
+  FileText,
+  Shield,
 } from 'lucide-react';
 import {
   DecryptedPrivatePayload,
@@ -29,6 +34,7 @@ import {
   Member,
   parsePasswordCardExtras,
   parseSubAccounts,
+  PasswordHistoryEntry,
   PasswordRecord,
   PasswordSosReason,
   SubAccountEntry,
@@ -36,6 +42,7 @@ import {
 } from '../types/vault';
 import {
   generateStrongPassword,
+  generateTotpCode,
   sanitizeSafeHttpUrl,
 } from '../lib/crypto';
 import { prepareOneClickLaunch } from '../lib/deviceAndBiometrics';
@@ -72,6 +79,10 @@ interface PasswordCardProps {
     newPassword?: string
   ) => Promise<void>;
   onClearSosRequest?: (record: PasswordRecord) => Promise<void>;
+  onUpdateCardMetadata?: (
+    record: PasswordRecord,
+    metadata: { profilePinOrNote?: string; totpSecret?: string }
+  ) => Promise<void>;
   onDeleteRecord: (record: PasswordRecord) => Promise<void>;
   onStartClipboardCountdown: (seconds: number, label: string) => void;
 }
@@ -93,6 +104,7 @@ const PasswordCardComponent: React.FC<PasswordCardProps> = ({
   onCreateSosRequest,
   onResolveSosRequest,
   onClearSosRequest,
+  onUpdateCardMetadata,
   onDeleteRecord,
   onStartClipboardCountdown,
 }) => {
@@ -143,6 +155,23 @@ const PasswordCardComponent: React.FC<PasswordCardProps> = ({
   const [newSubPassword, setNewSubPassword] = useState('');
   const [isSavingSubAccount, setIsSavingSubAccount] = useState(false);
 
+  // Pillar 1 & 2 state: Password History Rollback, TV Profile PIN/Note & Live 2FA TOTP Clock
+  const [isHistoryOpen, setIsHistoryOpen] = useState(false);
+  const [revealedHistoryIndices, setRevealedHistoryIndices] = useState<
+    number[]
+  >([]);
+  const [restoringHistoryIdx, setRestoringHistoryIdx] = useState<number | null>(
+    null
+  );
+  const [isEditingMetadata, setIsEditingMetadata] = useState(false);
+  const [pinOrNoteInput, setPinOrNoteInput] = useState('');
+  const [totpSecretInput, setTotpSecretInput] = useState('');
+  const [isSavingMetadata, setIsSavingMetadata] = useState(false);
+  const [liveTotpData, setLiveTotpData] = useState<{
+    code: string;
+    secondsRemaining: number;
+  } | null>(null);
+
   const isPrivate = record.section === 'private';
   const isOwner = record.ownerId === currentMember.id;
   const isAdmin =
@@ -154,6 +183,18 @@ const PasswordCardComponent: React.FC<PasswordCardProps> = ({
   const cardExtras = useMemo(() => parsePasswordCardExtras(record), [record]);
   const isFavorite = cardExtras.favoriteMemberIds.includes(currentMember.id);
   const sosTicket = !isPrivate ? cardExtras.sosTicket : null;
+
+  const effectiveProfilePinOrNote = isPrivate
+    ? decryptedPrivate?.profilePinOrNote || cardExtras.profilePinOrNote
+    : cardExtras.profilePinOrNote;
+
+  const effectiveTotpSecret = isPrivate
+    ? decryptedPrivate?.totpSecret || cardExtras.totpSecret
+    : cardExtras.totpSecret;
+
+  const effectivePasswordHistory: PasswordHistoryEntry[] = isPrivate
+    ? decryptedPrivate?.passwordHistory || cardExtras.passwordHistory || []
+    : cardExtras.passwordHistory || [];
 
   const subAccounts = !isPrivate ? parseSubAccounts(record) : [];
   const myAssignedSubAccount =
@@ -403,6 +444,95 @@ const PasswordCardComponent: React.FC<PasswordCardProps> = ({
     displayLogin,
     displayPassword,
   ]);
+
+  // Pillar 2: Live 6-digit 2FA TOTP Clock (updates every 1s in browser RAM via Web Crypto HMAC-SHA1)
+  useEffect(() => {
+    if (!effectiveTotpSecret || (!isDetailsOpen && !magnifiedViewData)) {
+      setLiveTotpData(null);
+      return;
+    }
+    let cancelled = false;
+    const updateTotp = async () => {
+      const res = await generateTotpCode(effectiveTotpSecret, Date.now());
+      if (!cancelled) {
+        setLiveTotpData(res);
+      }
+    };
+    void updateTotp();
+    const interval = window.setInterval(() => {
+      void updateTotp();
+    }, 1000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+    };
+  }, [effectiveTotpSecret, isDetailsOpen, magnifiedViewData]);
+
+  // Pillar 3: Privacy Shield (masks revealed passwords & closes modals when app/tab goes to background without logging out)
+  useEffect(() => {
+    const maskSensitiveState = () => {
+      setShowPassword(false);
+      setRevealedSubPassIds([]);
+      setRevealedHistoryIndices([]);
+      setMagnifiedViewData(null);
+      setIsQrModalOpen(false);
+    };
+    const handleVisibility = () => {
+      if (document.visibilityState === 'hidden') {
+        maskSensitiveState();
+      }
+    };
+    window.addEventListener('fsv-privacy-shield-activated', maskSensitiveState);
+    document.addEventListener('visibilitychange', handleVisibility);
+    return () => {
+      window.removeEventListener(
+        'fsv-privacy-shield-activated',
+        maskSensitiveState
+      );
+      document.removeEventListener('visibilitychange', handleVisibility);
+    };
+  }, []);
+
+  // Pillar 2: Global Escape key closes Magnifier ("Lupa") or QR Code modals
+  useEffect(() => {
+    if (!magnifiedViewData && !isQrModalOpen) return;
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        setMagnifiedViewData(null);
+        setIsQrModalOpen(false);
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [magnifiedViewData, isQrModalOpen]);
+
+  const handleSaveCardMetadataSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!onUpdateCardMetadata || isSavingMetadata) return;
+    setIsSavingMetadata(true);
+    try {
+      await onUpdateCardMetadata(record, {
+        profilePinOrNote: pinOrNoteInput.trim() || undefined,
+        totpSecret: totpSecretInput.trim() || undefined,
+      });
+      setIsEditingMetadata(false);
+    } finally {
+      setIsSavingMetadata(false);
+    }
+  };
+
+  const handleRestoreHistoryEntry = async (
+    entry: PasswordHistoryEntry,
+    idx: number
+  ) => {
+    if (restoringHistoryIdx !== null) return;
+    setRestoringHistoryIdx(idx);
+    try {
+      await onQuickUpdatePassword(record, entry.passwordValue);
+    } finally {
+      setRestoringHistoryIdx(null);
+    }
+  };
 
   const handleToggleFavoriteClick = async (e: React.MouseEvent) => {
     e.stopPropagation();
@@ -733,6 +863,24 @@ const PasswordCardComponent: React.FC<PasswordCardProps> = ({
             </div>
 
             <div className="flex items-center gap-1.5 shrink-0">
+              {isOwnerOrAdmin && onUpdateCardMetadata && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (!isEditingMetadata) {
+                      setPinOrNoteInput(effectiveProfilePinOrNote || '');
+                      setTotpSecretInput(effectiveTotpSecret || '');
+                    }
+                    setIsEditingMetadata((v) => !v);
+                  }}
+                  className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-[var(--vault-text)] border border-[var(--vault-border)] rounded-lg hover:bg-[var(--vault-surface-hover)] transition-colors whitespace-nowrap cursor-pointer"
+                  title="Ustaw lub edytuj PIN do profilu TV / notatkę oraz klucz 2FA TOTP"
+                >
+                  <FileText className="w-3.5 h-3.5 text-[var(--vault-accent)]" />
+                  <span>PIN / 2FA</span>
+                </button>
+              )}
+
               {canUpdatePrimaryDisplayedPassword && (
                 <button
                   type="button"
@@ -974,7 +1122,148 @@ const PasswordCardComponent: React.FC<PasswordCardProps> = ({
                 </button>
               </div>
             </div>
+
+            {/* Pillar 2: Optional PIN do profilu TV / Notatka Row */}
+            {effectiveProfilePinOrNote && (
+              <div className="flex items-center justify-between gap-3 text-sm pt-2 border-t border-[var(--vault-border)]">
+                <div className="min-w-0">
+                  <span className="text-xs text-[var(--vault-muted)] flex items-center gap-1">
+                    <FileText className="w-3 h-3 text-[var(--vault-accent)]" />
+                    <span>PIN do profilu TV / Notatka</span>
+                  </span>
+                  <span className="font-mono text-xs sm:text-sm font-semibold text-[var(--vault-text)] break-words block mt-0.5">
+                    {effectiveProfilePinOrNote}
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() =>
+                    handleCopy(effectiveProfilePinOrNote, 'pin_note', false)
+                  }
+                  className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium text-[var(--vault-muted)] hover:text-[var(--vault-text)] border border-[var(--vault-border)] rounded-lg hover:bg-[var(--vault-surface)] transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                >
+                  {copiedField === 'pin_note' ? (
+                    <>
+                      <Check className="w-3.5 h-3.5 text-[var(--vault-success)]" />
+                      <span>Skopiowano</span>
+                    </>
+                  ) : (
+                    <>
+                      <Copy className="w-3.5 h-3.5" />
+                      <span>Kopiuj PIN</span>
+                    </>
+                  )}
+                </button>
+              </div>
+            )}
+
+            {/* Pillar 2: Live 6-Digit 2FA TOTP Clock Row */}
+            {liveTotpData && (
+              <div className="flex items-center justify-between gap-3 text-sm pt-2 border-t border-[var(--vault-border)]">
+                <div className="min-w-0">
+                  <span className="text-xs text-[var(--vault-muted)] flex items-center gap-1.5">
+                    <Shield className="w-3 h-3 text-[var(--vault-success)]" />
+                    <span>Kod 2FA TOTP (na żywo)</span>
+                    <span className="inline-flex items-center gap-1 text-[11px] font-mono text-[var(--vault-accent)] tabular-nums">
+                      <Clock className="w-3 h-3" />
+                      <span>{liveTotpData.secondsRemaining}s</span>
+                    </span>
+                  </span>
+                  <span className="font-mono text-base font-bold tracking-wider text-[var(--vault-accent)] tabular-nums block mt-0.5">
+                    {liveTotpData.code}
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() =>
+                    handleCopy(
+                      liveTotpData.code.replace(/\s+/g, ''),
+                      'totp_code',
+                      false
+                    )
+                  }
+                  className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-semibold text-[var(--vault-text)] border border-[var(--vault-accent)]/60 rounded-lg hover:bg-[var(--vault-surface)] transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                >
+                  {copiedField === 'totp_code' ? (
+                    <>
+                      <Check className="w-3.5 h-3.5 text-[var(--vault-success)]" />
+                      <span>Skopiowano 2FA</span>
+                    </>
+                  ) : (
+                    <>
+                      <Copy className="w-3.5 h-3.5 text-[var(--vault-accent)]" />
+                      <span>Kopiuj kod 2FA</span>
+                    </>
+                  )}
+                </button>
+              </div>
+            )}
           </div>
+
+          {/* Inline Editor for PIN do profilu TV / Notatka & Klucz 2FA TOTP */}
+          {isEditingMetadata && isOwnerOrAdmin && onUpdateCardMetadata && (
+            <form
+              onSubmit={handleSaveCardMetadataSubmit}
+              className="p-3.5 rounded-lg border border-[var(--vault-accent)] bg-[var(--vault-bg)] space-y-3 text-xs"
+            >
+              <div className="font-semibold text-[var(--vault-text)] flex items-center justify-between">
+                <span>
+                  Edycja PIN-u do profilu TV / Notatki oraz Klucza 2FA TOTP
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setIsEditingMetadata(false)}
+                  className="text-[11px] text-[var(--vault-muted)] hover:text-[var(--vault-text)] cursor-pointer"
+                >
+                  Zamknij
+                </button>
+              </div>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                <div>
+                  <label className="block text-[11px] text-[var(--vault-muted)] mb-1">
+                    PIN do profilu TV / Notatka (widoczna także w Lupie)
+                  </label>
+                  <input
+                    type="text"
+                    value={pinOrNoteInput}
+                    onChange={(e) => setPinOrNoteInput(e.target.value)}
+                    placeholder="np. PIN profilu TV: 2580"
+                    maxLength={120}
+                    className="w-full px-2.5 py-1.5 text-xs font-mono rounded-lg border border-[var(--vault-border)] bg-[var(--vault-surface)] text-[var(--vault-text)] focus:outline-none focus:border-[var(--vault-accent)]"
+                  />
+                </div>
+                <div>
+                  <label className="block text-[11px] text-[var(--vault-muted)] mb-1">
+                    Klucz 2FA TOTP (Base32 z Google Authenticator)
+                  </label>
+                  <input
+                    type="text"
+                    value={totpSecretInput}
+                    onChange={(e) => setTotpSecretInput(e.target.value)}
+                    placeholder="np. JBSWY3DPEHPK3PXP"
+                    maxLength={128}
+                    className="w-full px-2.5 py-1.5 text-xs font-mono rounded-lg border border-[var(--vault-border)] bg-[var(--vault-surface)] text-[var(--vault-text)] focus:outline-none focus:border-[var(--vault-accent)]"
+                  />
+                </div>
+              </div>
+              <div className="flex justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={() => setIsEditingMetadata(false)}
+                  className="px-3 py-1 text-xs text-[var(--vault-muted)] hover:text-[var(--vault-text)] cursor-pointer"
+                >
+                  Anuluj
+                </button>
+                <button
+                  type="submit"
+                  disabled={isSavingMetadata}
+                  className="px-3.5 py-1.5 text-xs font-semibold text-[#FAF7F2] bg-[var(--vault-accent)] hover:bg-[var(--vault-accent-hover)] rounded-lg cursor-pointer"
+                >
+                  {isSavingMetadata ? 'Zapisywanie...' : 'Zapisz PIN / 2FA'}
+                </button>
+              </div>
+            </form>
+          )}
 
           {/* Inline Quick Password Update (for primary displayed password / subaccount) */}
           {isUpdatingPassword && (
@@ -1023,6 +1312,133 @@ const PasswordCardComponent: React.FC<PasswordCardProps> = ({
                 </button>
               </div>
             </form>
+          )}
+
+          {/* Pillar 1: Collapsible Password History (Last 3 Passwords + 1-Click Rollback) */}
+          {isOwnerOrAdmin && effectivePasswordHistory.length > 0 && (
+            <div className="rounded-lg border border-[var(--vault-border)] bg-[var(--vault-bg)] overflow-hidden text-xs">
+              <button
+                type="button"
+                onClick={() => setIsHistoryOpen((v) => !v)}
+                className="w-full px-3 py-2 flex items-center justify-between gap-2 text-left hover:bg-[var(--vault-surface-hover)] transition-colors cursor-pointer"
+              >
+                <div className="flex items-center gap-2 text-[var(--vault-text)] font-medium">
+                  <History className="w-3.5 h-3.5 text-[var(--vault-accent)] shrink-0" />
+                  <span>
+                    Historia poprzednich haseł ({effectivePasswordHistory.length}/3) — Cofnij zmianę 1-Klik
+                  </span>
+                </div>
+                <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-[var(--vault-accent)] shrink-0">
+                  <span>{isHistoryOpen ? 'Zwiń' : 'Pokaż historię'}</span>
+                  {isHistoryOpen ? (
+                    <ChevronUp className="w-3.5 h-3.5" />
+                  ) : (
+                    <ChevronDown className="w-3.5 h-3.5" />
+                  )}
+                </span>
+              </button>
+
+              {isHistoryOpen && (
+                <div className="p-3 border-t border-[var(--vault-border)] bg-[var(--vault-surface)] space-y-2">
+                  <p className="text-[11px] text-[var(--vault-muted)]">
+                    Jeśli zmiana hasła na docelowej stronie (np. Netflix, router, bank) nie powiodła się, możesz jednym kliknięciem przywrócić poprzednie hasło:
+                  </p>
+                  <div className="space-y-1.5">
+                    {effectivePasswordHistory.map((hist, idx) => {
+                      const isHistRevealed =
+                        revealedHistoryIndices.includes(idx);
+                      const formattedHistDate = hist.changedAt
+                        ? new Date(hist.changedAt).toLocaleString('pl-PL', {
+                            day: '2-digit',
+                            month: '2-digit',
+                            year: 'numeric',
+                            hour: '2-digit',
+                            minute: '2-digit',
+                          })
+                        : '';
+                      return (
+                        <div
+                          key={`hist_${idx}_${hist.changedAt}`}
+                          className="p-2.5 rounded-lg border border-[var(--vault-border)] bg-[var(--vault-bg)] flex flex-col sm:flex-row sm:items-center justify-between gap-2"
+                        >
+                          <div className="min-w-0 space-y-0.5">
+                            <div className="font-mono text-xs text-[var(--vault-text)] truncate tabular-nums">
+                              {isHistRevealed
+                                ? hist.passwordValue
+                                : '•'.repeat(
+                                    Math.min(
+                                      Math.max(hist.passwordValue.length, 8),
+                                      16
+                                    )
+                                  )}
+                            </div>
+                            <div className="text-[10px] text-[var(--vault-muted)] tabular-nums">
+                              Zmieniono: {formattedHistDate} · przez:{' '}
+                              <strong>{hist.changedBy}</strong>
+                            </div>
+                          </div>
+
+                          <div className="flex items-center gap-1.5 shrink-0">
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setRevealedHistoryIndices((prev) =>
+                                  prev.includes(idx)
+                                    ? prev.filter((i) => i !== idx)
+                                    : [...prev, idx]
+                                )
+                              }
+                              className="p-1 text-[var(--vault-muted)] hover:text-[var(--vault-text)] border border-[var(--vault-border)] rounded cursor-pointer"
+                              title={
+                                isHistRevealed
+                                  ? 'Ukryj poprzednie hasło'
+                                  : 'Pokaż poprzednie hasło'
+                              }
+                            >
+                              {isHistRevealed ? (
+                                <EyeOff className="w-3.5 h-3.5" />
+                              ) : (
+                                <Eye className="w-3.5 h-3.5" />
+                              )}
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() =>
+                                handleCopy(
+                                  hist.passwordValue,
+                                  `hist_${idx}`,
+                                  true
+                                )
+                              }
+                              className="px-2 py-1 text-[11px] font-medium text-[var(--vault-muted)] hover:text-[var(--vault-text)] border border-[var(--vault-border)] rounded cursor-pointer"
+                            >
+                              {copiedField === `hist_${idx}`
+                                ? 'Skopiowano'
+                                : 'Kopiuj'}
+                            </button>
+                            <button
+                              type="button"
+                              disabled={restoringHistoryIdx !== null}
+                              onClick={() =>
+                                handleRestoreHistoryEntry(hist, idx)
+                              }
+                              className="inline-flex items-center gap-1 px-2.5 py-1 text-[11px] font-bold text-[#FAF7F2] bg-[var(--vault-accent)] hover:bg-[var(--vault-accent-hover)] disabled:opacity-50 rounded cursor-pointer"
+                            >
+                              <RotateCcw className="w-3 h-3" />
+                              <span>
+                                {restoringHistoryIdx === idx
+                                  ? 'Przywracanie...'
+                                  : 'Przywróć to hasło'}
+                              </span>
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+            </div>
           )}
 
           {/* MULTIKONTA / SUBKONTA SECTION (Visible to Owner and Admin on Shared records, e.g. Netflix +10 zł) */}
@@ -1678,6 +2094,69 @@ const PasswordCardComponent: React.FC<PasswordCardProps> = ({
                 {magnifiedViewData.password}
               </div>
             </div>
+
+            {/* Pillar 2: Large TV Profile PIN / Note & Live 2FA TOTP inside Magnifier ("Lupa") */}
+            {(effectiveProfilePinOrNote || liveTotpData) && (
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                {effectiveProfilePinOrNote && (
+                  <div className="p-4 rounded-xl border-2 border-[var(--vault-border)] bg-[var(--vault-bg)] space-y-1.5">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-xs font-bold uppercase tracking-wider text-[var(--vault-muted)] flex items-center gap-1.5">
+                        <FileText className="w-4 h-4 text-[var(--vault-accent)]" />
+                        <span>PIN profilu TV / Notatka</span>
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          handleCopy(
+                            effectiveProfilePinOrNote,
+                            'magnified_pin_note',
+                            false
+                          )
+                        }
+                        className="px-2.5 py-1 text-xs font-semibold text-[var(--vault-text)] border border-[var(--vault-border)] bg-[var(--vault-surface)] rounded-lg cursor-pointer"
+                      >
+                        {copiedField === 'magnified_pin_note'
+                          ? 'Skopiowano!'
+                          : 'Kopiuj'}
+                      </button>
+                    </div>
+                    <div className="font-mono text-2xl sm:text-3xl font-bold text-[var(--vault-accent)] break-words select-all">
+                      {effectiveProfilePinOrNote}
+                    </div>
+                  </div>
+                )}
+
+                {liveTotpData && (
+                  <div className="p-4 rounded-xl border-2 border-[var(--vault-success)] bg-[var(--vault-bg)] space-y-1.5">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-xs font-bold uppercase tracking-wider text-[var(--vault-success)] flex items-center gap-1.5">
+                        <Shield className="w-4 h-4" />
+                        <span>Kod 2FA TOTP ({liveTotpData.secondsRemaining}s)</span>
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          handleCopy(
+                            liveTotpData.code.replace(/\s+/g, ''),
+                            'magnified_totp',
+                            false
+                          )
+                        }
+                        className="px-2.5 py-1 text-xs font-semibold text-[var(--vault-text)] border border-[var(--vault-border)] bg-[var(--vault-surface)] rounded-lg cursor-pointer"
+                      >
+                        {copiedField === 'magnified_totp'
+                          ? 'Skopiowano!'
+                          : 'Kopiuj 2FA'}
+                      </button>
+                    </div>
+                    <div className="font-mono text-2xl sm:text-4xl font-bold tracking-widest text-[var(--vault-success)] tabular-nums select-all">
+                      {liveTotpData.code}
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
 
             {/* Character-by-Character Breakdown Grid */}
             <div className="space-y-2.5">

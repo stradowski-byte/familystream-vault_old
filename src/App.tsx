@@ -16,6 +16,8 @@ import {
   Send,
   ChevronDown,
   ChevronUp,
+  EyeOff,
+  Shield,
 } from 'lucide-react';
 import {
   onAuthStateChanged,
@@ -63,6 +65,7 @@ import {
   Member,
   parsePasswordCardExtras,
   parseSubAccounts,
+  PasswordHistoryEntry,
   PasswordRecord,
   PasswordSosReason,
   serializePasswordCardExtras,
@@ -73,6 +76,7 @@ import {
   VaultInvitation,
 } from './types/vault';
 import {
+  checkPasswordPwnedKAnonymity,
   decryptVaultBackupFile,
   encryptPrivateRecordPayload,
   encryptVaultBackupFile,
@@ -226,6 +230,15 @@ export default function App() {
   const [resolvingSosRecordId, setResolvingSosRecordId] = useState<
     string | null
   >(null);
+
+  // Pillar 2 & 3 State: Search shortcut ref, Privacy Shield (background masking without logout), and Zero-Knowledge Breach Check
+  const searchInputRef = useRef<HTMLInputElement | null>(null);
+  const [isPrivacyShieldActive, setIsPrivacyShieldActive] = useState(false);
+  const [pwnedCheckResults, setPwnedCheckResults] = useState<
+    Record<string, number>
+  >({});
+  const [isCheckingBreaches, setIsCheckingBreaches] = useState(false);
+  const [hasRunBreachCheck, setHasRunBreachCheck] = useState(false);
 
   // Clipboard auto-clear timer state
   const [clipboardCountdown, setClipboardCountdown] = useState<{
@@ -712,6 +725,53 @@ export default function App() {
       events.forEach((ev) => window.removeEventListener(ev, resetTimer));
     };
   }, [currentMember, isVaultLockedByTimeout, vaultConfig?.autoLockMinutes]);
+
+  // Pillar 3: Privacy Shield when app/tab goes to background (masks revealed passwords & puts up shield WITHOUT logging out!)
+  useEffect(() => {
+    if (!currentMember || isVaultLockedByTimeout) {
+      setIsPrivacyShieldActive(false);
+      return;
+    }
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'hidden') {
+        setIsPrivacyShieldActive(true);
+        window.dispatchEvent(new CustomEvent('fsv-privacy-shield-activated'));
+      } else if (document.visibilityState === 'visible') {
+        setIsPrivacyShieldActive(false);
+      }
+    };
+
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+    };
+  }, [currentMember, isVaultLockedByTimeout]);
+
+  // Pillar 2: Global keyboard shortcuts (`/` focuses search bar, `Escape` closes modals)
+  useEffect(() => {
+    if (!currentMember || isVaultLockedByTimeout) return;
+    const handleGlobalKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        setIsAddModalOpen(false);
+        setShowIOSInstallModal(false);
+        return;
+      }
+      const target = e.target as HTMLElement | null;
+      const isInputFocused =
+        target &&
+        (target.tagName === 'INPUT' ||
+          target.tagName === 'TEXTAREA' ||
+          target.tagName === 'SELECT' ||
+          target.isContentEditable);
+      if (e.key === '/' && !isInputFocused && activeAdminTab === 'vault') {
+        e.preventDefault();
+        searchInputRef.current?.focus();
+      }
+    };
+    window.addEventListener('keydown', handleGlobalKeyDown);
+    return () => window.removeEventListener('keydown', handleGlobalKeyDown);
+  }, [currentMember, isVaultLockedByTimeout, activeAdminTab]);
 
   // Categories parsed from vaultConfig
   const categories: VaultCategory[] = useMemo(() => {
@@ -1792,10 +1852,14 @@ export default function App() {
     allowedMemberIds: string[];
     revealToAdmin?: boolean;
     subAccounts?: SubAccountEntry[];
+    profilePinOrNote?: string;
+    totpSecret?: string;
   }) => {
     if (!currentMember || !activeDekBase64) return;
     const now = new Date().toISOString();
     const pwId = makeId('pw');
+    const cleanPinNote = params.profilePinOrNote?.trim() || undefined;
+    const cleanTotp = params.totpSecret?.trim() || undefined;
 
     if (params.section === 'private') {
       const plainPrivatePayload: DecryptedPrivatePayload = {
@@ -1804,6 +1868,9 @@ export default function App() {
         serviceUrl: params.serviceUrl,
         login: params.login,
         password: params.password,
+        passwordHistory: [],
+        ...(cleanPinNote ? { profilePinOrNote: cleanPinNote } : {}),
+        ...(cleanTotp ? { totpSecret: cleanTotp } : {}),
       };
       const encryptedPayload = await encryptPrivateRecordPayload(
         plainPrivatePayload,
@@ -1829,7 +1896,14 @@ export default function App() {
           currentMember.id
         ),
         revealToAdmin: shouldReveal,
-        subAccountsJson: '[]',
+        subAccountsJson: serializePasswordCardExtras({
+          subAccounts: [],
+          sosTicket: null,
+          favoriteMemberIds: [],
+          passwordHistory: [],
+          profilePinOrNote: shouldReveal ? cleanPinNote : undefined,
+          totpSecret: shouldReveal ? cleanTotp : undefined,
+        }),
         createdAt: now,
         updatedAt: now,
         passwordUpdatedAt: now,
@@ -1856,7 +1930,14 @@ export default function App() {
         ownerName: currentMember.fullName,
         allowedMemberIds: mergedAllowed,
         revealToAdmin: false,
-        subAccountsJson: JSON.stringify(subList),
+        subAccountsJson: serializePasswordCardExtras({
+          subAccounts: subList,
+          sosTicket: null,
+          favoriteMemberIds: [],
+          passwordHistory: [],
+          profilePinOrNote: cleanPinNote,
+          totpSecret: cleanTotp,
+        }),
         createdAt: now,
         updatedAt: now,
         passwordUpdatedAt: now,
@@ -1989,8 +2070,26 @@ export default function App() {
     const existingTicket = currentExtras.sosTicket;
     if (!existingTicket) return;
 
+    const trimmedNewPass = newPassword?.trim() || '';
+    const nextHistory: PasswordHistoryEntry[] =
+      trimmedNewPass &&
+      record.passwordValue &&
+      record.passwordValue !== trimmedNewPass
+        ? [
+            {
+              passwordValue: record.passwordValue,
+              changedAt: now,
+              changedBy: currentMember.fullName,
+            },
+            ...(currentExtras.passwordHistory || []).filter(
+              (h) => h.passwordValue !== record.passwordValue
+            ),
+          ].slice(0, 3)
+        : currentExtras.passwordHistory || [];
+
     const nextSubAccountsJson = serializePasswordCardExtras({
       ...currentExtras,
+      passwordHistory: nextHistory,
       sosTicket: {
         ...existingTicket,
         status: 'resolved',
@@ -2005,8 +2104,8 @@ export default function App() {
       updatedAt: now,
     };
 
-    if (newPassword && newPassword.trim()) {
-      updates.passwordValue = newPassword.trim();
+    if (trimmedNewPass) {
+      updates.passwordValue = trimmedNewPass;
       updates.passwordUpdatedAt = now;
     }
 
@@ -2041,6 +2140,54 @@ export default function App() {
     });
   };
 
+  const handleUpdateCardMetadata = async (
+    record: PasswordRecord,
+    metadata: { profilePinOrNote?: string; totpSecret?: string }
+  ) => {
+    if (!currentMember) return;
+    const now = new Date().toISOString();
+    const currentExtras = parsePasswordCardExtras(record);
+    const cleanPinNote = metadata.profilePinOrNote?.trim() || undefined;
+    const cleanTotp = metadata.totpSecret?.trim() || undefined;
+
+    if (record.section === 'private') {
+      const currentDecrypted = decryptedPrivateMap[record.id];
+      if (!currentDecrypted || !activeDekBase64) {
+        showToast('Nie można odszyfrować rekordu prywatnego.');
+        return;
+      }
+      const updatedPrivatePayload: DecryptedPrivatePayload = {
+        ...currentDecrypted,
+        profilePinOrNote: cleanPinNote,
+        totpSecret: cleanTotp,
+      };
+      const reEncrypted = await encryptPrivateRecordPayload(
+        updatedPrivatePayload,
+        activeDekBase64
+      );
+      await savePasswordToFirestore(record.id, {
+        encryptedPayload: reEncrypted,
+        subAccountsJson: serializePasswordCardExtras({
+          ...currentExtras,
+          profilePinOrNote: record.revealToAdmin ? cleanPinNote : undefined,
+          totpSecret: record.revealToAdmin ? cleanTotp : undefined,
+        }),
+        updatedAt: now,
+      });
+    } else {
+      await savePasswordToFirestore(record.id, {
+        subAccountsJson: serializePasswordCardExtras({
+          ...currentExtras,
+          profilePinOrNote: cleanPinNote,
+          totpSecret: cleanTotp,
+        }),
+        updatedAt: now,
+      });
+    }
+
+    showToast('Zapisano PIN do profilu TV / notatkę oraz klucz 2FA TOTP!');
+  };
+
   const handleOneClickRotateAuditPassword = async (record: PasswordRecord) => {
     if (!currentMember) return;
     setRotatingPasswordId(record.id);
@@ -2052,7 +2199,7 @@ export default function App() {
           record.section === 'private'
             ? decryptedPrivateMap[record.id]?.serviceName || record.serviceName
             : record.serviceName
-        }!`
+        } (poprzednie hasło zachowano w Historii)!`
       );
     } finally {
       setRotatingPasswordId(null);
@@ -2065,16 +2212,39 @@ export default function App() {
   ) => {
     if (!currentMember || !activeDekBase64) return;
     const now = new Date().toISOString();
+    const currentExtras = parsePasswordCardExtras(record);
 
     if (record.section === 'private') {
       const currentDecrypted = decryptedPrivateMap[record.id];
       if (!currentDecrypted) {
         throw new Error('Nie można odszyfrować rekordu prywatnego do edycji.');
       }
+      const oldPlain = currentDecrypted.password;
+      const existingHist =
+        currentDecrypted.passwordHistory ||
+        currentExtras.passwordHistory ||
+        [];
+      const nextHistory: PasswordHistoryEntry[] =
+        oldPlain && oldPlain !== newPassword
+          ? [
+              {
+                passwordValue: oldPlain,
+                changedAt: now,
+                changedBy: currentMember.fullName,
+              },
+              ...existingHist.filter(
+                (h) =>
+                  h.passwordValue !== oldPlain &&
+                  h.passwordValue !== newPassword
+              ),
+            ].slice(0, 3)
+          : existingHist.slice(0, 3);
+
       const reEncrypted = await encryptPrivateRecordPayload(
         {
           ...currentDecrypted,
           password: newPassword,
+          passwordHistory: nextHistory,
         },
         activeDekBase64
       );
@@ -2083,12 +2253,38 @@ export default function App() {
           ? newPassword
           : reEncrypted.slice(0, 96) + '...',
         encryptedPayload: reEncrypted,
+        subAccountsJson: serializePasswordCardExtras({
+          ...currentExtras,
+          passwordHistory: record.revealToAdmin ? nextHistory : [],
+        }),
         updatedAt: now,
         passwordUpdatedAt: now,
       });
     } else {
+      const oldPlain = record.passwordValue;
+      const existingHist = currentExtras.passwordHistory || [];
+      const nextHistory: PasswordHistoryEntry[] =
+        oldPlain && oldPlain !== newPassword
+          ? [
+              {
+                passwordValue: oldPlain,
+                changedAt: now,
+                changedBy: currentMember.fullName,
+              },
+              ...existingHist.filter(
+                (h) =>
+                  h.passwordValue !== oldPlain &&
+                  h.passwordValue !== newPassword
+              ),
+            ].slice(0, 3)
+          : existingHist.slice(0, 3);
+
       await savePasswordToFirestore(record.id, {
         passwordValue: newPassword,
+        subAccountsJson: serializePasswordCardExtras({
+          ...currentExtras,
+          passwordHistory: nextHistory,
+        }),
         updatedAt: now,
         passwordUpdatedAt: now,
       });
@@ -2099,10 +2295,12 @@ export default function App() {
       currentMember.fullName,
       'PASSWORD_QUICK_UPDATE',
       record.section === 'private'
-        ? 'Zaktualizowano hasło w istniejącym rekordzie prywatnym (AES-256-GCM).'
-        : `Zaktualizowano hasło w istniejącym wpisie wspólnym: ${record.serviceName}.`
+        ? 'Zaktualizowano hasło w istniejącym rekordzie prywatnym (AES-256-GCM, zapisano w historii 3 zmian).'
+        : `Zaktualizowano hasło w istniejącym wpisie wspólnym: ${record.serviceName} (zapisano w historii 3 zmian).`
     );
-    showToast('Zaktualizowano hasło w istniejącym rekordzie!');
+    showToast(
+      'Zaktualizowano hasło (poprzednie hasło zapisano w Historii 3 zmian)!'
+    );
   };
 
   const handleToggleRevealToAdmin = async (
@@ -2854,6 +3052,11 @@ export default function App() {
           serviceName: string;
           reason: string;
         }[],
+        resolvedItems: [] as {
+          record: PasswordRecord;
+          plainPassword: string;
+          serviceName: string;
+        }[],
       };
     }
 
@@ -2980,8 +3183,41 @@ export default function App() {
       duplicates,
       oldPasswords,
       weakPasswords,
+      resolvedItems,
     };
   })();
+
+  // Pillar 3: Zero-Knowledge k-Anonymity Breach Check (sends ONLY 5-char SHA-1 prefix to HaveIBeenPwned Range API)
+  const handleRunZeroKnowledgeBreachCheck = async () => {
+    if (isCheckingBreaches || passwordHealthAudit.resolvedItems.length === 0) {
+      return;
+    }
+    setIsCheckingBreaches(true);
+    try {
+      const nextResults: Record<string, number> = {};
+      let breachedCount = 0;
+      for (const item of passwordHealthAudit.resolvedItems) {
+        try {
+          const count = await checkPasswordPwnedKAnonymity(item.plainPassword);
+          nextResults[item.record.id] = count;
+          if (count > 0) {
+            breachedCount++;
+          }
+        } catch {
+          nextResults[item.record.id] = 0;
+        }
+      }
+      setPwnedCheckResults(nextResults);
+      setHasRunBreachCheck(true);
+      showToast(
+        breachedCount > 0
+          ? `Wykryto ${breachedCount} haseł w publicznych wyciekach danych! Wymień je 1-Klikiem.`
+          : 'Zero-Knowledge Test Wycieków zakończony: żadne z Twoich haseł nie figuruje w bazie wycieków!'
+      );
+    } finally {
+      setIsCheckingBreaches(false);
+    }
+  };
 
   const currentDeviceDoc = currentMember
     ? devices.find(
@@ -3070,6 +3306,27 @@ export default function App() {
       {toastMessage && (
         <div className="fixed bottom-5 right-5 z-50 px-4 py-3 rounded-xl border border-[var(--vault-accent)] bg-[var(--vault-surface)] text-xs font-medium text-[var(--vault-text)] shadow-lg">
           {toastMessage}
+        </div>
+      )}
+
+      {/* Pillar 3: Privacy Shield Curtain when switching apps/tabs in background (masks passwords without logging out) */}
+      {isPrivacyShieldActive && currentMember && !isVaultLockedByTimeout && (
+        <div
+          onClick={() => setIsPrivacyShieldActive(false)}
+          className="fixed inset-0 z-[100] bg-[var(--vault-bg)] flex flex-col items-center justify-center p-6 text-center select-none cursor-pointer"
+        >
+          <div className="max-w-md w-full p-8 rounded-2xl border-2 border-[var(--vault-accent)] bg-[var(--vault-surface)] space-y-4 shadow-2xl">
+            <EyeOff className="w-12 h-12 text-[var(--vault-accent)] mx-auto" />
+            <h2 className="text-xl font-bold font-display text-[var(--vault-text)]">
+              Tarcza Prywatności Ekranu Aktywna
+            </h2>
+            <p className="text-xs text-[var(--vault-muted)] leading-relaxed">
+              Wszystkie odsłonięte hasła oraz okna Lupy zostały automatycznie zamaskowane na czas pracy aplikacji w tle (bez wylogowania z sesji).
+            </p>
+            <span className="inline-block px-4 py-2 text-xs font-semibold text-[#FAF7F2] bg-[var(--vault-accent)] rounded-lg">
+              Dotknij ekranu, aby wrócić do skarbca
+            </span>
+          </div>
         </div>
       )}
 
@@ -3621,6 +3878,111 @@ export default function App() {
                             </div>
                           </div>
                         )}
+
+                        {/* Pillar 3: Zero-Knowledge SHA-1 k-Anonymity Breach Check Section */}
+                        <div className="pt-3 border-t border-[var(--vault-border)] flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                          <div className="space-y-0.5">
+                            <div className="font-bold text-[var(--vault-text)] flex items-center gap-1.5">
+                              <Shield className="w-3.5 h-3.5 text-[var(--vault-accent)] shrink-0" />
+                              <span>
+                                Test Wycieków Zero-Knowledge (SHA-1 k-Anonimowość)
+                              </span>
+                            </div>
+                            <p className="text-[11px] text-[var(--vault-muted)]">
+                              Sprawdza Twoje hasła w bazie miliardów wycieków (HaveIBeenPwned) wysyłając wyłącznie 5 pierwszych znaków skrótu SHA-1. Żadne hasło nigdy nie opuszcza przeglądarki.
+                            </p>
+                          </div>
+                          <button
+                            type="button"
+                            disabled={isCheckingBreaches}
+                            onClick={handleRunZeroKnowledgeBreachCheck}
+                            className="inline-flex items-center justify-center gap-1.5 px-3.5 py-2 text-xs font-bold text-[#FAF7F2] bg-[var(--vault-accent)] hover:bg-[var(--vault-accent-hover)] disabled:opacity-50 rounded-lg cursor-pointer shrink-0"
+                          >
+                            <RefreshCw
+                              className={`w-3.5 h-3.5 ${
+                                isCheckingBreaches ? 'animate-spin' : ''
+                              }`}
+                            />
+                            <span>
+                              {isCheckingBreaches
+                                ? 'Weryfikacja prefiksów SHA-1...'
+                                : 'Sprawdź w bazie wycieków (Zero-Knowledge)'}
+                            </span>
+                          </button>
+                        </div>
+
+                        {hasRunBreachCheck && (
+                          <div className="p-3 rounded-lg border border-[var(--vault-border)] bg-[var(--vault-surface)] space-y-2">
+                            {passwordHealthAudit.resolvedItems.every(
+                              (item) => (pwnedCheckResults[item.record.id] || 0) === 0
+                            ) ? (
+                              <div className="flex items-center gap-2 text-[var(--vault-success)] font-semibold">
+                                <ShieldCheck className="w-4 h-4 shrink-0" />
+                                <span>
+                                  Wynik testu k-Anonimowości: 0 wycieków! Żadne z Twoich haseł ({passwordHealthAudit.resolvedItems.length}) nie figuruje w publicznych bazach wycieków.
+                                </span>
+                              </div>
+                            ) : (
+                              <div className="space-y-2">
+                                <div className="text-[var(--vault-danger)] font-bold flex items-center gap-1.5">
+                                  <ShieldAlert className="w-4 h-4 shrink-0" />
+                                  <span>
+                                    Wykryto hasła obecne w publicznych wyciekach danych:
+                                  </span>
+                                </div>
+                                <div className="space-y-1.5">
+                                  {passwordHealthAudit.resolvedItems
+                                    .filter(
+                                      (item) =>
+                                        (pwnedCheckResults[item.record.id] || 0) > 0
+                                    )
+                                    .map((item) => {
+                                      const count =
+                                        pwnedCheckResults[item.record.id] || 0;
+                                      const canRotate =
+                                        item.record.ownerId ===
+                                          currentMember.id ||
+                                        (item.record.section === 'shared' &&
+                                          (isOwnerAdmin || isTrustedCoAdmin));
+                                      return (
+                                        <div
+                                          key={`pwned_${item.record.id}`}
+                                          className="flex items-center justify-between gap-2 pt-1.5 border-t border-[var(--vault-border)]"
+                                        >
+                                          <div className="min-w-0">
+                                            <span className="font-semibold text-[var(--vault-text)]">
+                                              {item.serviceName}
+                                            </span>
+                                            <span className="text-[11px] text-[var(--vault-danger)] font-mono ml-2 tabular-nums">
+                                              Wystąpień w wyciekach: {count.toLocaleString('pl-PL')}
+                                            </span>
+                                          </div>
+                                          {canRotate && (
+                                            <button
+                                              type="button"
+                                              disabled={
+                                                rotatingPasswordId ===
+                                                item.record.id
+                                              }
+                                              onClick={() =>
+                                                handleOneClickRotateAuditPassword(
+                                                  item.record
+                                                )
+                                              }
+                                              className="inline-flex items-center gap-1 px-2.5 py-1 text-[11px] font-bold text-[#FAF7F2] bg-[var(--vault-danger)] hover:opacity-90 rounded cursor-pointer shrink-0"
+                                            >
+                                              <RefreshCw className="w-3 h-3" />
+                                              <span>Wymień 1-Klik</span>
+                                            </button>
+                                          )}
+                                        </div>
+                                      );
+                                    })}
+                                </div>
+                              </div>
+                            )}
+                          </div>
+                        )}
                       </div>
                     )}
                   </div>
@@ -3632,10 +3994,11 @@ export default function App() {
                     <div className="relative flex-1">
                       <Search className="w-4 h-4 text-[var(--vault-muted)] absolute left-3 top-1/2 -translate-y-1/2" />
                       <input
+                        ref={searchInputRef}
                         type="text"
                         value={searchQuery}
                         onChange={(e) => setSearchQuery(e.target.value)}
-                        placeholder="Szukaj serwisu VOD, poczty, sklepu lub loginu..."
+                        placeholder="Szukaj serwisu VOD, poczty, sklepu lub loginu... (skrót: /)"
                         className="w-full pl-9 pr-4 py-2 text-sm rounded-lg border border-[var(--vault-border)] bg-[var(--vault-bg)] text-[var(--vault-text)] focus:outline-none focus:border-[var(--vault-accent)]"
                       />
                     </div>
@@ -3779,6 +4142,7 @@ export default function App() {
                               onCreateSosRequest={handleCreateSosRequest}
                               onResolveSosRequest={handleResolveSosRequest}
                               onClearSosRequest={handleClearSosRequest}
+                              onUpdateCardMetadata={handleUpdateCardMetadata}
                               onDeleteRecord={handleDeleteRecord}
                               onStartClipboardCountdown={startClipboardCountdown}
                             />
@@ -3835,6 +4199,7 @@ export default function App() {
                               onUpdateSubAccounts={handleUpdateSubAccounts}
                               onToggleRevealToAdmin={handleToggleRevealToAdmin}
                               onToggleFavorite={handleToggleFavorite}
+                              onUpdateCardMetadata={handleUpdateCardMetadata}
                               onDeleteRecord={handleDeleteRecord}
                               onStartClipboardCountdown={startClipboardCountdown}
                             />
@@ -3896,6 +4261,7 @@ export default function App() {
                                 }
                                 onUpdateSubAccounts={handleUpdateSubAccounts}
                                 onToggleFavorite={handleToggleFavorite}
+                                onUpdateCardMetadata={handleUpdateCardMetadata}
                                 onDeleteRecord={handleDeleteRecord}
                                 onStartClipboardCountdown={
                                   startClipboardCountdown

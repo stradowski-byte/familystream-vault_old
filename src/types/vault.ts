@@ -230,17 +230,31 @@ export interface PasswordSosTicket {
   resolvedAt?: string;
 }
 
+export interface PasswordHistoryEntry {
+  passwordValue: string;
+  changedAt: string;
+  changedBy: string;
+}
+
 export interface PasswordCardExtras {
   subAccounts: SubAccountEntry[];
   sosTicket: PasswordSosTicket | null;
   favoriteMemberIds: string[];
+  passwordHistory: PasswordHistoryEntry[];
+  profilePinOrNote?: string;
+  totpSecret?: string;
 }
 
 export function parsePasswordCardExtras(
   record: PasswordRecord
 ): PasswordCardExtras {
   if (!record.subAccountsJson) {
-    return { subAccounts: [], sosTicket: null, favoriteMemberIds: [] };
+    return {
+      subAccounts: [],
+      sosTicket: null,
+      favoriteMemberIds: [],
+      passwordHistory: [],
+    };
   }
   try {
     const parsed = JSON.parse(record.subAccountsJson);
@@ -249,6 +263,7 @@ export function parsePasswordCardExtras(
         subAccounts: parsed as SubAccountEntry[],
         sosTicket: null,
         favoriteMemberIds: [],
+        passwordHistory: [],
       };
     }
     if (parsed && typeof parsed === 'object') {
@@ -260,13 +275,46 @@ export function parsePasswordCardExtras(
             ? (obj.sosTicket as PasswordSosTicket)
             : null,
         favoriteMemberIds: Array.isArray(obj.favoriteMemberIds)
-          ? obj.favoriteMemberIds.filter((id): id is string => typeof id === 'string')
+          ? obj.favoriteMemberIds.filter(
+              (id): id is string => typeof id === 'string'
+            )
           : [],
+        passwordHistory: Array.isArray(obj.passwordHistory)
+          ? obj.passwordHistory
+              .filter(
+                (entry): entry is PasswordHistoryEntry =>
+                  Boolean(
+                    entry &&
+                      typeof entry === 'object' &&
+                      typeof entry.passwordValue === 'string'
+                  )
+              )
+              .slice(0, 3)
+          : [],
+        profilePinOrNote:
+          typeof obj.profilePinOrNote === 'string' &&
+          obj.profilePinOrNote.trim()
+            ? obj.profilePinOrNote.trim()
+            : undefined,
+        totpSecret:
+          typeof obj.totpSecret === 'string' && obj.totpSecret.trim()
+            ? obj.totpSecret.trim()
+            : undefined,
       };
     }
-    return { subAccounts: [], sosTicket: null, favoriteMemberIds: [] };
+    return {
+      subAccounts: [],
+      sosTicket: null,
+      favoriteMemberIds: [],
+      passwordHistory: [],
+    };
   } catch {
-    return { subAccounts: [], sosTicket: null, favoriteMemberIds: [] };
+    return {
+      subAccounts: [],
+      sosTicket: null,
+      favoriteMemberIds: [],
+      passwordHistory: [],
+    };
   }
 }
 
@@ -276,14 +324,27 @@ export function serializePasswordCardExtras(
   const cleanFavs = Array.from(
     new Set((extras.favoriteMemberIds || []).filter(Boolean))
   );
-  // If there is no SOS ticket and no favorites, store as plain array for 100% backward compatibility
-  if (!extras.sosTicket && cleanFavs.length === 0) {
+  const cleanHistory = (extras.passwordHistory || []).slice(0, 3);
+  const cleanPinNote = extras.profilePinOrNote?.trim() || undefined;
+  const cleanTotp = extras.totpSecret?.trim() || undefined;
+
+  // If there are no extra metadata fields, store as plain array for 100% backward compatibility
+  if (
+    !extras.sosTicket &&
+    cleanFavs.length === 0 &&
+    cleanHistory.length === 0 &&
+    !cleanPinNote &&
+    !cleanTotp
+  ) {
     return JSON.stringify(extras.subAccounts || []);
   }
   return JSON.stringify({
     subAccounts: extras.subAccounts || [],
     sosTicket: extras.sosTicket || null,
     favoriteMemberIds: cleanFavs,
+    passwordHistory: cleanHistory,
+    ...(cleanPinNote ? { profilePinOrNote: cleanPinNote } : {}),
+    ...(cleanTotp ? { totpSecret: cleanTotp } : {}),
   });
 }
 
@@ -297,6 +358,9 @@ export interface DecryptedPrivatePayload {
   serviceUrl: string;
   login: string;
   password: string;
+  passwordHistory?: PasswordHistoryEntry[];
+  profilePinOrNote?: string;
+  totpSecret?: string;
 }
 
 export interface ActivityLog {

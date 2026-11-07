@@ -452,3 +452,138 @@ export function sanitizeSafeHttpUrl(rawUrl?: string | null): string | null {
   }
 }
 
+/**
+ * Decodes a Base32 string (RFC 4648, used by Google Authenticator / 2FA TOTP secrets)
+ * into a Uint8Array. Ignores spaces, hyphens, and padding '='.
+ */
+function base32ToBytes(rawBase32: string): Uint8Array | null {
+  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+  const cleaned = rawBase32
+    .toUpperCase()
+    .replace(/[\s\-=]+/g, '')
+    .trim();
+  if (!cleaned) return null;
+
+  let bits = 0;
+  let value = 0;
+  const output: number[] = [];
+
+  for (let i = 0; i < cleaned.length; i++) {
+    const idx = alphabet.indexOf(cleaned[i]);
+    if (idx === -1) {
+      return null;
+    }
+    value = (value << 5) | idx;
+    bits += 5;
+    if (bits >= 8) {
+      output.push((value >>> (bits - 8)) & 0xff);
+      bits -= 8;
+    }
+  }
+  return new Uint8Array(output);
+}
+
+/**
+ * Generates a live 6-digit RFC 6238 TOTP 2FA code (30-second window)
+ * 100% locally in the browser using Web Crypto API (`HMAC-SHA1`).
+ */
+export async function generateTotpCode(
+  secretBase32: string,
+  nowMs: number = Date.now()
+): Promise<{ code: string; secondsRemaining: number } | null> {
+  const keyBytes = base32ToBytes(secretBase32);
+  if (!keyBytes || keyBytes.length === 0) return null;
+
+  try {
+    const epochSeconds = Math.floor(nowMs / 1000);
+    const timeStep = 30;
+    const counter = Math.floor(epochSeconds / timeStep);
+    const secondsRemaining = timeStep - (epochSeconds % timeStep);
+
+    const counterBuffer = new ArrayBuffer(8);
+    const view = new DataView(counterBuffer);
+    view.setUint32(0, Math.floor(counter / 0x100000000), false);
+    view.setUint32(4, counter >>> 0, false);
+
+    const cryptoKey = await window.crypto.subtle.importKey(
+      'raw',
+      keyBytes.buffer as ArrayBuffer,
+      { name: 'HMAC', hash: 'SHA-1' },
+      false,
+      ['sign']
+    );
+
+    const signature = await window.crypto.subtle.sign(
+      'HMAC',
+      cryptoKey,
+      counterBuffer
+    );
+    const hmac = new Uint8Array(signature);
+    const offset = hmac[hmac.length - 1] & 0x0f;
+    const binary =
+      ((hmac[offset] & 0x7f) << 24) |
+      ((hmac[offset + 1] & 0xff) << 16) |
+      ((hmac[offset + 2] & 0xff) << 8) |
+      (hmac[offset + 3] & 0xff);
+
+    const otp = (binary % 1000000).toString().padStart(6, '0');
+    return {
+      code: `${otp.slice(0, 3)} ${otp.slice(3)}`,
+      secondsRemaining,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Zero-Knowledge k-Anonymity Password Breach Check (HaveIBeenPwned Range API):
+ * 1. Computes full SHA-1 hash of the password locally in Web Crypto API.
+ * 2. Sends ONLY the first 5 hex characters (prefix) to `https://api.pwnedpasswords.com/range/{prefix}`.
+ * 3. Compares the remaining 35 hex characters (suffix) strictly in local RAM.
+ * The full password or its full hash NEVER leaves the user's browser!
+ * Returns the number of breach occurrences (0 = safe / not found).
+ */
+export async function checkPasswordPwnedKAnonymity(
+  password: string
+): Promise<number> {
+  const trimmed = password.trim();
+  if (!trimmed) return 0;
+
+  const encoded = new TextEncoder().encode(trimmed);
+  const digestBuffer = await window.crypto.subtle.digest('SHA-1', encoded);
+  const hashHex = Array.from(new Uint8Array(digestBuffer))
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('')
+    .toUpperCase();
+
+  const prefix = hashHex.slice(0, 5);
+  const suffix = hashHex.slice(5);
+
+  const response = await fetch(
+    `https://api.pwnedpasswords.com/range/${prefix}`,
+    {
+      method: 'GET',
+      headers: {
+        'Add-Padding': 'true',
+      },
+    }
+  );
+
+  if (!response.ok) {
+    throw new Error(`Błąd zapytania k-Anonimowości (${response.status})`);
+  }
+
+  const text = await response.text();
+  const lines = text.split(/\r?\n/);
+  for (const line of lines) {
+    const [lineSuffix, countStr] = line.split(':');
+    if (lineSuffix && lineSuffix.trim().toUpperCase() === suffix) {
+      const count = parseInt((countStr || '0').trim(), 10);
+      return Number.isNaN(count) ? 0 : count;
+    }
+  }
+  return 0;
+}
+
+

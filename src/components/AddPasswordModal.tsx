@@ -29,6 +29,8 @@ interface AddPasswordModalProps {
     allowedMemberIds: string[];
     revealToAdmin?: boolean;
     subAccounts?: SubAccountEntry[];
+    profilePinOrNote?: string;
+    totpSecret?: string;
   }) => Promise<void>;
 }
 
@@ -48,6 +50,8 @@ export const AddPasswordModal: React.FC<AddPasswordModalProps> = ({
   const [serviceUrl, setServiceUrl] = useState('');
   const [login, setLogin] = useState('');
   const [password, setPassword] = useState('');
+  const [profilePinOrNote, setProfilePinOrNote] = useState('');
+  const [totpSecret, setTotpSecret] = useState('');
   const [revealToAdmin, setRevealToAdmin] = useState(false);
 
   // By default, a newly created shared login is assigned ONLY to the creator ([currentMember.id])
@@ -156,12 +160,16 @@ export const AddPasswordModal: React.FC<AddPasswordModalProps> = ({
         allowedMemberIds: finalAllowed,
         revealToAdmin: section === 'private' ? revealToAdmin : false,
         subAccounts: section === 'shared' ? subAccounts : [],
+        profilePinOrNote: profilePinOrNote.trim() || undefined,
+        totpSecret: totpSecret.trim() || undefined,
       });
 
       setServiceName('');
       setServiceUrl('');
       setLogin('');
       setPassword('');
+      setProfilePinOrNote('');
+      setTotpSecret('');
       setRevealToAdmin(false);
       setAllowedMemberIds([currentMember.id]);
       setIsMembersDropdownOpen(false);
@@ -341,6 +349,36 @@ export const AddPasswordModal: React.FC<AddPasswordModalProps> = ({
               required
               className="w-full px-3 py-2 text-sm font-mono rounded-lg border border-[var(--vault-border)] bg-[var(--vault-bg)] text-[var(--vault-text)] focus:outline-none focus:border-[var(--vault-accent)]"
             />
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <div>
+              <label className="block text-xs font-medium text-[var(--vault-muted)] mb-1">
+                PIN do profilu TV / Notatka (opcjonalnie)
+              </label>
+              <input
+                type="text"
+                value={profilePinOrNote}
+                onChange={(e) => setProfilePinOrNote(e.target.value)}
+                placeholder="np. PIN profilu TV: 2580"
+                maxLength={120}
+                className="w-full px-3 py-2 text-xs font-mono rounded-lg border border-[var(--vault-border)] bg-[var(--vault-bg)] text-[var(--vault-text)] focus:outline-none focus:border-[var(--vault-accent)]"
+              />
+            </div>
+
+            <div>
+              <label className="block text-xs font-medium text-[var(--vault-muted)] mb-1">
+                Klucz 2FA TOTP Base32 (opcjonalnie)
+              </label>
+              <input
+                type="text"
+                value={totpSecret}
+                onChange={(e) => setTotpSecret(e.target.value)}
+                placeholder="np. JBSWY3DPEHPK3PXP"
+                maxLength={128}
+                className="w-full px-3 py-2 text-xs font-mono rounded-lg border border-[var(--vault-border)] bg-[var(--vault-bg)] text-[var(--vault-text)] focus:outline-none focus:border-[var(--vault-accent)]"
+              />
+            </div>
           </div>
 
           {section === 'shared' && (
